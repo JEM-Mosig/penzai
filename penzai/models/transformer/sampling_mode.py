@@ -179,7 +179,8 @@ class KVCachingTransformerLM(pz.nn.Layer):
           masker, kv_positions_input_name="kv_token_positions"
       )
 
-    cached_axes = {
+    # Default cached axes from metadata, used as fallback.
+    default_cached_axes = {
         **batch_axes,
         **uncached.metadata.common_head_axes,
         "projection": uncached.metadata.projection_dim,
@@ -195,6 +196,19 @@ class KVCachingTransformerLM(pz.nn.Layer):
           )
           .apply(_fix_attn_mask)
       )
+      # Infer per-layer cache axes from the key projection Linear, to handle
+      # models with different projection dims or KV head counts per layer
+      # (e.g. Gemma 4 local vs global attention).
+      key_linears = (
+          pz.select(attn.input_to_key)
+          .at_instances_of(pz.nn.Linear)
+          .get_sequence()
+      )
+      if key_linears:
+        cached_axes = {**batch_axes, **key_linears[0].output_axes}
+      else:
+        cached_axes = default_cached_axes
+
       fixed_attns[keypath] = pz.nn.KVCachingAttention.from_uncached(
           attn_with_new_kv_positions,
           cache_len=cache_len,

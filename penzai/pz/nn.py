@@ -31,6 +31,7 @@ from penzai.nn.basic_ops import (
 )
 from penzai.nn.combinators import (
     Residual,
+    ScaledResidual,
     BranchAndAddTogether,
     BranchAndMultiplyTogether,
 )

@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 from penzai import pz
 from penzai.models.transformer import model_parts
+from penzai.nn import parameters
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,11 +105,24 @@ class LlamalikeTransformerConfig:
     activation_dtype: Floating dtype to use for activations and KV cache tables.
     use_layer_stack: Whether to stack the blocks together using a LayerStack.
     use_qk_norm: Whether to use QK normalization.
+    use_value_norm: Whether to use value normalization (RMSNorm on value
+      projections, used by Gemma 4).
+    use_skip_scale: Whether to use a learnable scale factor on the attention
+      skip connection (used by Gemma 4).
+    global_projection_dim: Projection dimension for global attention layers.
+      If None, uses the same projection_dim as local layers.
+    global_num_kv_heads: Number of KV heads for global attention layers.
+      If None, uses the same num_kv_heads as local layers.
+    global_rope_proportion: Fraction of head dimensions that receive RoPE in
+      global attention layers. If None, all dimensions receive RoPE (as for
+      local layers). Used by Gemma 4 with partial_rotary_factor=0.25.
     global_scale_factor: Scale factor for the global RoPE layers (scale factor
       for the local RoPE layers is set as 1.0 by default).
     local_rope_wavelength: Wavelength for the local RoPE layers. If None, local
       RoPE layers will use the same wavelength as global RoPE layers
       (config.rope_wavelength).
+    k_eq_v_global: Whether global attention layers share key and value
+      projections (K=V). Used by Gemma 4 31B and 26B-A4B.
   """
 
   num_kv_heads: int
@@ -134,8 +148,14 @@ class LlamalikeTransformerConfig:
   activation_dtype: jax.typing.DTypeLike = jnp.float32
   use_layer_stack: bool = False
   use_qk_norm: bool = False
+  use_value_norm: bool = False
+  use_skip_scale: bool = False
+  global_projection_dim: int | None = None
+  global_num_kv_heads: int | None = None
+  global_rope_proportion: float | None = None
   global_scale_factor: float | None = None
   local_rope_wavelength: float | None = None
+  k_eq_v_global: bool = False
 
 
 def build_llamalike_feedforward(
@@ -203,22 +223,22 @@ def build_llamalike_feedforward(
   ])
 
 
-def _head_info(config: LlamalikeTransformerConfig):
+def _head_info(num_kv_heads: int, query_head_multiplier: int):
   """Computes query, key, and value head axes and einsum names."""
-  if config.query_head_multiplier == 1:
-    common_head_axes = {"heads": config.num_kv_heads}
+  if query_head_multiplier == 1:
+    common_head_axes = {"heads": num_kv_heads}
     qkv_einsum = {"heads": "h"}
     query_only_head_axes = {}
     q_einsum = {}
-  elif config.num_kv_heads == 1:
+  elif num_kv_heads == 1:
     common_head_axes = {}
     qkv_einsum = {}
-    query_only_head_axes = {"query_heads": config.query_head_multiplier}
+    query_only_head_axes = {"query_heads": query_head_multiplier}
     q_einsum = {"query_heads": "h"}
   else:
-    common_head_axes = {"head_groups": config.num_kv_heads}
+    common_head_axes = {"head_groups": num_kv_heads}
     qkv_einsum = {"head_groups": "hg"}
-    query_only_head_axes = {"query_heads": config.query_head_multiplier}
+    query_only_head_axes = {"query_heads": query_head_multiplier}
     q_einsum = {"query_heads": "hq"}
   return (common_head_axes, qkv_einsum, query_only_head_axes, q_einsum)
 
@@ -242,16 +262,6 @@ def build_llamalike_attention(
     An Attention block.
   """
   embedding_dim = config.embedding_dim
-  projection_dim = config.projection_dim
-
-  common_head_axes, qkv_einsum, query_only_head_axes, q_einsum = _head_info(
-      config
-  )
-
-  if config.query_scaling_factor == "default":
-    query_scaling_factor = projection_dim**-0.5
-  else:
-    query_scaling_factor = config.query_scaling_factor
 
   # As used in https://github.com/google-deepmind/gemma.
   # (This exact value is probably not important.)
@@ -268,12 +278,36 @@ def build_llamalike_attention(
         block_index % len(config.attention_type)
     ]
 
+  # Resolve per-layer effective dimensions based on attention type.
+  is_global = isinstance(attention_type, AttentionTypeGlobalCausal)
+  if is_global and config.global_projection_dim is not None:
+    projection_dim = config.global_projection_dim
+  else:
+    projection_dim = config.projection_dim
+
+  if is_global and config.global_num_kv_heads is not None:
+    effective_num_kv_heads = config.global_num_kv_heads
+  else:
+    effective_num_kv_heads = config.num_kv_heads
+
+  total_query_heads = config.num_kv_heads * config.query_head_multiplier
+  effective_query_head_multiplier = total_query_heads // effective_num_kv_heads
+
+  common_head_axes, qkv_einsum, query_only_head_axes, q_einsum = _head_info(
+      effective_num_kv_heads, effective_query_head_multiplier
+  )
+
+  if config.query_scaling_factor == "default":
+    query_scaling_factor = projection_dim**-0.5
+  else:
+    query_scaling_factor = config.query_scaling_factor
+
+  # Determine RoPE wavelength, scale factor, and masker for this layer type.
   if isinstance(attention_type, AttentionTypeSlidingWindowCausal):
     attn_masker = pz.nn.ApplyCausalSlidingWindowAttentionMask(
         sliding_window_size=attention_type.window_size,
         masked_out_value=masked_out_value,
     )
-    # Decide which wavelength to use for local RoPE.
     if config.local_rope_wavelength is not None:
       wavelength = config.local_rope_wavelength
     else:
@@ -284,7 +318,6 @@ def build_llamalike_attention(
         masked_out_value=masked_out_value,
     )
     wavelength = config.rope_wavelength
-    # Decide which scale factor to use for global RoPE.
     if config.global_scale_factor is not None:
       scale_factor = config.global_scale_factor
     else:
@@ -292,6 +325,31 @@ def build_llamalike_attention(
   else:
     raise ValueError(f"Unsupported attention type {attention_type}")
 
+  # Decide whether to use full or partial RoPE for this layer.
+  rope_proportion = config.global_rope_proportion if is_global else None
+  if rope_proportion is not None and rope_proportion < 1.0:
+    rope_subset_size = int(projection_dim * rope_proportion)
+  else:
+    rope_subset_size = None
+
+  def _make_rope_layer():
+    if rope_subset_size is not None:
+      return pz.nn.ApplyRoPEToSubset(
+          positions_input_name="token_positions",
+          embedding_axis="projection",
+          max_wavelength=wavelength,
+          rope_subset_size=rope_subset_size,
+          scale_factor=scale_factor,
+      )
+    else:
+      return pz.nn.ApplyRoPE(
+          positions_input_name="token_positions",
+          embedding_axis="projection",
+          max_wavelength=wavelength,
+          scale_factor=scale_factor,
+      )
+
+  # Build query-key attention scoring sublayers.
   query_key_to_attn_sublayers = [
       pz.nn.NamedEinsum(
           (
@@ -314,7 +372,7 @@ def build_llamalike_attention(
       pz.nn.Softmax("kv_seq"),
   ])
 
-  # add qk norm if needed in the module of input_to_query sublayers
+  # Build query sublayers.
   input_to_query_sublayers = [
       pz.nn.Linear.from_config(
           name=f"{name}/query",
@@ -333,64 +391,71 @@ def build_llamalike_attention(
         pz.nn.RMSLayerNorm.from_config(
             name=f"{name}/query_norm",
             init_base_rng=init_base_rng,
-            across_axes={"projection": config.projection_dim},
+            across_axes={"projection": projection_dim},
             dtype=config.parameter_dtype,
             epsilon=config.rms_norm_eps,
         ),
     )
   input_to_query_sublayers.extend([
-      pz.nn.ApplyRoPE(
-          positions_input_name="token_positions",
-          embedding_axis="projection",
-          max_wavelength=wavelength,
-          scale_factor=scale_factor,
-      ),
+      _make_rope_layer(),
       pz.nn.ConstantRescale(
           by=jnp.array(query_scaling_factor, dtype=config.activation_dtype)
       ),
   ])
 
-  # add qk norm if needed in the module of input_to_key sublayers
-  input_to_key_sublayers = [
-      pz.nn.Linear.from_config(
-          name=f"{name}/key",
-          init_base_rng=init_base_rng,
-          input_axes={"embedding": embedding_dim},
-          output_axes={**common_head_axes, "projection": projection_dim},
-          dtype=config.parameter_dtype,
-      ),
-  ]
+  # Build key and value sublayers, with optional K=V sharing for global layers.
+  k_eq_v = is_global and config.k_eq_v_global
+
+  kv_linear = pz.nn.Linear.from_config(
+      name=f"{name}/key",
+      init_base_rng=init_base_rng,
+      input_axes={"embedding": embedding_dim},
+      output_axes={**common_head_axes, "projection": projection_dim},
+      dtype=config.parameter_dtype,
+  )
+
+  input_to_key_sublayers = [kv_linear]
   if config.use_qk_norm:
     input_to_key_sublayers.append(
         pz.nn.RMSLayerNorm.from_config(
             name=f"{name}/key_norm",
             init_base_rng=init_base_rng,
-            across_axes={"projection": config.projection_dim},
+            across_axes={"projection": projection_dim},
             dtype=config.parameter_dtype,
             epsilon=config.rms_norm_eps,
         ),
     )
-  input_to_key_sublayers.append(
-      pz.nn.ApplyRoPE(
-          positions_input_name="token_positions",
-          embedding_axis="projection",
-          max_wavelength=wavelength,
-          scale_factor=scale_factor,
-      ),
-  )
+  input_to_key_sublayers.append(_make_rope_layer())
+
+  if k_eq_v:
+    # K=V sharing: reuse the same Linear for both key and value,
+    # following the embedding-tying pattern.
+    input_to_value_sublayers = [kv_linear]
+  else:
+    input_to_value_sublayers = [
+        pz.nn.Linear.from_config(
+            name=f"{name}/value",
+            init_base_rng=init_base_rng,
+            input_axes={"embedding": embedding_dim},
+            output_axes={**common_head_axes, "projection": projection_dim},
+            dtype=config.parameter_dtype,
+        ),
+    ]
+  if config.use_value_norm:
+    input_to_value_sublayers.append(
+        pz.nn.RMSLayerNorm.from_config(
+            name=f"{name}/value_norm",
+            init_base_rng=init_base_rng,
+            across_axes={"projection": projection_dim},
+            dtype=config.parameter_dtype,
+            epsilon=config.rms_norm_eps,
+        ),
+    )
 
   return pz.nn.Attention(
       input_to_query=pz.nn.Sequential(input_to_query_sublayers),
       input_to_key=pz.nn.Sequential(input_to_key_sublayers),
-      input_to_value=pz.nn.Sequential([
-          pz.nn.Linear.from_config(
-              name=f"{name}/value",
-              init_base_rng=init_base_rng,
-              input_axes={"embedding": embedding_dim},
-              output_axes={**common_head_axes, "projection": projection_dim},
-              dtype=config.parameter_dtype,
-          ),
-      ]),
+      input_to_value=pz.nn.Sequential(input_to_value_sublayers),
       query_key_to_attn=pz.nn.Sequential(query_key_to_attn_sublayers),
       attn_value_to_output=pz.nn.Sequential([
           pz.nn.NamedEinsum(
@@ -478,9 +543,22 @@ def build_llamalike_block(
             epsilon=config.rms_norm_eps,
         )
     )
+  attn_delta = pz.nn.Sequential(attn_sequence)
+  if config.use_skip_scale:
+    attn_residual = pz.nn.ScaledResidual(
+        delta=attn_delta,
+        scale=parameters.make_parameter(
+            f"{name}/skip.scale",
+            init_base_rng,
+            initializer=lambda _rng: pz.nx.wrap(jnp.array(1.0)),
+        ),
+    )
+  else:
+    attn_residual = pz.nn.Residual(attn_delta)
+
   return model_parts.TransformerBlock(
       sublayers=[
-          pz.nn.Residual(pz.nn.Sequential(attn_sequence)),
+          attn_residual,
           pz.nn.Residual(pz.nn.Sequential(ffw_sequence)),
       ],
   )
@@ -581,7 +659,9 @@ def build_llamalike_transformer(
         )
     )
 
-  common_head_axes, _, query_only_head_axes, _ = _head_info(config)
+  common_head_axes, _, query_only_head_axes, _ = _head_info(
+      config.num_kv_heads, config.query_head_multiplier
+  )
   return model_parts.TransformerLM(
       metadata=model_parts.TransformerMetadata(
           common_head_axes=common_head_axes,
