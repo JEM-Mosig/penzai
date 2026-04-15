@@ -107,6 +107,29 @@ class LlamalikeTransformerTest(parameterized.TestCase):
           global_rope_proportion=0.25,
           local_rope_wavelength=10_000,
       ),
+      dict(
+          testcase_name="like_gemma4_e4b",
+          num_kv_heads=2,
+          query_head_multiplier=4,
+          num_decoder_blocks=6,
+          parameter_dtype=jnp.bfloat16,
+          activation_dtype=jnp.bfloat16,
+          attention_type=(
+              llamalike_common.AttentionTypeSlidingWindowCausal(8),
+              llamalike_common.AttentionTypeSlidingWindowCausal(8),
+              llamalike_common.AttentionTypeGlobalCausal(),
+          ),
+          global_projection_dim=8,
+          use_qk_norm=True,
+          use_value_norm=True,
+          use_post_attn_norm=True,
+          use_post_ffw_norm=True,
+          use_skip_scale=True,
+          global_rope_proportion=0.25,
+          local_rope_wavelength=10_000,
+          per_layer_input_dim=4,
+          num_kv_shared_layers=3,
+      ),
   )
   def test_build_and_run_gemma(
       self,
@@ -117,6 +140,8 @@ class LlamalikeTransformerTest(parameterized.TestCase):
       mlp_variant="geglu_approx",
       **extra_kwargs,
   ):
+    num_decoder_blocks = extra_kwargs.pop("num_decoder_blocks", 2)
+
     def run_traced(rng_key):
 
       model = llamalike_common.build_llamalike_transformer(
@@ -126,7 +151,7 @@ class LlamalikeTransformerTest(parameterized.TestCase):
               embedding_dim=16,
               projection_dim=4,
               mlp_hidden_dim=32,
-              num_decoder_blocks=2,
+              num_decoder_blocks=num_decoder_blocks,
               vocab_size=11,
               parameter_dtype=parameter_dtype,
               activation_dtype=activation_dtype,
@@ -222,6 +247,29 @@ class LlamalikeTransformerTest(parameterized.TestCase):
           global_rope_proportion=0.25,
           local_rope_wavelength=10_000,
       ),
+      dict(
+          testcase_name="like_gemma4_e4b",
+          num_kv_heads=2,
+          query_head_multiplier=4,
+          num_decoder_blocks=6,
+          parameter_dtype=jnp.bfloat16,
+          activation_dtype=jnp.bfloat16,
+          attention_type=(
+              llamalike_common.AttentionTypeSlidingWindowCausal(8),
+              llamalike_common.AttentionTypeSlidingWindowCausal(8),
+              llamalike_common.AttentionTypeGlobalCausal(),
+          ),
+          global_projection_dim=8,
+          use_qk_norm=True,
+          use_value_norm=True,
+          use_post_attn_norm=True,
+          use_post_ffw_norm=True,
+          use_skip_scale=True,
+          global_rope_proportion=0.25,
+          local_rope_wavelength=10_000,
+          per_layer_input_dim=4,
+          num_kv_shared_layers=3,
+      ),
   )
   def test_build_and_run_sampling_mode(
       self,
@@ -231,6 +279,7 @@ class LlamalikeTransformerTest(parameterized.TestCase):
       activation_dtype,
       **extra_kwargs,
   ):
+    num_decoder_blocks = extra_kwargs.pop("num_decoder_blocks", 2)
 
     model = llamalike_common.build_llamalike_transformer(
         llamalike_common.LlamalikeTransformerConfig(
@@ -239,7 +288,7 @@ class LlamalikeTransformerTest(parameterized.TestCase):
             embedding_dim=16,
             projection_dim=4,
             mlp_hidden_dim=32,
-            num_decoder_blocks=2,
+            num_decoder_blocks=num_decoder_blocks,
             vocab_size=11,
             mlp_variant="geglu_approx",
             rope_wavelength=10_000,

@@ -147,4 +147,9 @@ class TransformerLM(pz.nn.Layer):
     """
     if token_positions is None:
       token_positions = pz.nx.arange("seq", tokens.named_shape["seq"])
-    return self.body(tokens, token_positions=token_positions, **side_inputs)
+    return self.body(
+        tokens,
+        token_positions=token_positions,
+        token_ids=tokens,
+        **side_inputs,
+    )

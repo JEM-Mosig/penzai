@@ -232,6 +232,58 @@ _GEMMA_PRESETS = {
         rope_wavelength=1_000_000,
         local_rope_wavelength=10_000,
     ),
+    "gemma4_e2b": dict(
+        num_decoder_blocks=35,
+        vocab_size=262_144,
+        num_kv_heads=1,
+        query_head_multiplier=8,
+        embedding_dim=1536,
+        projection_dim=256,
+        global_projection_dim=512,
+        mlp_hidden_dim=6_144,
+        attention_type=_make_attention_layers_types(
+            pattern=(llamalike_common.AttentionTypeSlidingWindowCausal(512),)
+            * 4
+            + (llamalike_common.AttentionTypeGlobalCausal(),),
+            num_layers=35,
+        ),
+        use_qk_norm=True,
+        use_value_norm=True,
+        use_post_attn_norm=True,
+        use_post_ffw_norm=True,
+        use_skip_scale=True,
+        global_rope_proportion=0.25,
+        rope_wavelength=1_000_000,
+        local_rope_wavelength=10_000,
+        per_layer_input_dim=256,
+        num_kv_shared_layers=20,
+    ),
+    "gemma4_e4b": dict(
+        num_decoder_blocks=42,
+        vocab_size=262_144,
+        num_kv_heads=2,
+        query_head_multiplier=4,
+        embedding_dim=2560,
+        projection_dim=256,
+        global_projection_dim=512,
+        mlp_hidden_dim=10_240,
+        attention_type=_make_attention_layers_types(
+            pattern=(llamalike_common.AttentionTypeSlidingWindowCausal(512),)
+            * 5
+            + (llamalike_common.AttentionTypeGlobalCausal(),),
+            num_layers=42,
+        ),
+        use_qk_norm=True,
+        use_value_norm=True,
+        use_post_attn_norm=True,
+        use_post_ffw_norm=True,
+        use_skip_scale=True,
+        global_rope_proportion=0.25,
+        rope_wavelength=1_000_000,
+        local_rope_wavelength=10_000,
+        per_layer_input_dim=256,
+        num_kv_shared_layers=18,
+    ),
 }
 _NEEDS_GATING_TRANSPOSE = {
     "gemma_2b": False,
@@ -244,6 +296,8 @@ _NEEDS_GATING_TRANSPOSE = {
     "gemma3_12b": True,
     "gemma3_27b": True,
     "gemma4_31b": True,
+    "gemma4_e2b": True,
+    "gemma4_e4b": True,
 }
 
 
@@ -262,6 +316,8 @@ def gemma_from_pretrained_checkpoint(
         "gemma3_12b",
         "gemma3_27b",
         "gemma4_31b",
+        "gemma4_e2b",
+        "gemma4_e4b",
         "auto",
     ] = "auto",
 ) -> model_parts.TransformerLM:
@@ -303,6 +359,7 @@ def gemma_from_pretrained_checkpoint(
         and "layer_0/attn/_key_norm" in params
     )
     has_skip_scale = "layer_0/skip_scale" in params
+    has_ple = "embedder/per_layer_embeddings" in params
     is_match = False
     for gemma_preset_name, kwargs in _GEMMA_PRESETS.items():
       if kwargs["num_decoder_blocks"] != num_layers:
@@ -315,13 +372,18 @@ def gemma_from_pretrained_checkpoint(
       preset_has_skip_scale = kwargs.get("use_skip_scale", False)
       if has_skip_scale != preset_has_skip_scale:
         continue
+      # Match PLE presence (distinguishes E2B/E4B from 31B).
+      preset_has_ple = kwargs.get("per_layer_input_dim") is not None
+      if has_ple != preset_has_ple:
+        continue
       is_match = True
       preset_name = gemma_preset_name
       break
     if not is_match:
       raise ValueError(
           f"Could not determine preset for model with {num_layers} layers,"
-          f" qk norm {qk_norm}, skip scale {has_skip_scale}."
+          f" qk norm {qk_norm}, skip scale {has_skip_scale},"
+          f" ple {has_ple}."
       )
 
   preset_kwargs = _GEMMA_PRESETS[preset_name]
@@ -353,6 +415,38 @@ def gemma_from_pretrained_checkpoint(
           1 + params["final_norm"]["scale"]
       ).tag("embedding"),
   }
+
+  # Add PLE (per-layer embeddings) parameters if present.
+  if config.per_layer_input_dim is not None:
+    ple_raw = params["embedder"]["per_layer_embeddings"]
+    # Checkpoint stores as [vocab, num_layers * ple_dim]; reshape to
+    # [vocab, num_layers, ple_dim].
+    ple_reshaped = ple_raw.reshape(
+        config.vocab_size, config.num_decoder_blocks, config.per_layer_input_dim
+    )
+    parameter_mapping["embedder/per_layer_embeddings"] = (
+        pz.nx.NamedArray.wrap(ple_reshaped).tag(
+            "vocabulary", "layers", "ple_input"
+        )
+    )
+    # Model projection: [num_layers * ple_dim, embedding_dim] in checkpoint.
+    ple_proj_raw = params["embedder"]["per_layer_model_projection"]
+    ple_proj_reshaped = ple_proj_raw.reshape(
+        config.num_decoder_blocks,
+        config.per_layer_input_dim,
+        config.embedding_dim,
+    )
+    parameter_mapping[
+        "embedder/per_layer_model_projection.weights"
+    ] = pz.nx.NamedArray.wrap(ple_proj_reshaped).tag(
+        "layers", "ple_input", "embedding"
+    )
+    # Projection norm.
+    parameter_mapping[
+        "embedder/per_layer_projection_norm/scale.weights"
+    ] = pz.nx.NamedArray.wrap(
+        1 + params["embedder"]["per_layer_projection_norm"]["scale"]
+    ).tag("ple_input")
 
   all_block_params = []
 
@@ -443,22 +537,49 @@ def gemma_from_pretrained_checkpoint(
     layer_query_head_multiplier = total_query_heads // layer_num_kv_heads
     layer_k_eq_v = layer_is_global and config.k_eq_v_global
 
+    # KV-shared layers do not have their own key/value weights.
+    num_non_shared = (
+        config.num_decoder_blocks - config.num_kv_shared_layers
+    )
+    is_kv_shared = i >= num_non_shared
+
+    # Add per-layer PLE weights if enabled.
+    if config.per_layer_input_dim is not None:
+      cur_block_params["per_layer_input_gate.weights"] = (
+          pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/per_layer_input_gate"]["w"]
+          ).tag("embedding", "ple_input")
+      )
+      cur_block_params["per_layer_projection.weights"] = (
+          pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/per_layer_projection"]["w"]
+          ).tag("ple_input", "embedding")
+      )
+      cur_block_params["post_per_layer_input_norm/scale.weights"] = (
+          pz.nx.NamedArray.wrap(
+              1
+              + params[f"layer_{i}/post_per_layer_input_norm"]["scale"]
+          ).tag("embedding")
+      )
+
     # Map attention parameters based on the per-layer head configuration.
+    # KV-shared layers have no key/value weights; only query and output.
     if layer_num_kv_heads == 1:
       cur_block_params["attention/query.weights"] = pz.nx.NamedArray.wrap(
           params[f"layer_{i}/attn/q_einsum"]["w"]
       ).tag("query_heads", "embedding", "projection")
-      if layer_k_eq_v:
-        cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
-            params[f"layer_{i}/attn/k_einsum"]["w"].squeeze(0)
-        ).tag("embedding", "projection")
-      else:
-        cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
-            params[f"layer_{i}/attn/kv_einsum"]["w"][0].squeeze(0)
-        ).tag("embedding", "projection")
-        cur_block_params["attention/value.weights"] = pz.nx.NamedArray.wrap(
-            params[f"layer_{i}/attn/kv_einsum"]["w"][1].squeeze(0)
-        ).tag("embedding", "projection")
+      if not is_kv_shared:
+        if layer_k_eq_v:
+          cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/attn/k_einsum"]["w"].squeeze(0)
+          ).tag("embedding", "projection")
+        else:
+          cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/attn/kv_einsum"]["w"][0].squeeze(0)
+          ).tag("embedding", "projection")
+          cur_block_params["attention/value.weights"] = pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/attn/kv_einsum"]["w"][1].squeeze(0)
+          ).tag("embedding", "projection")
       cur_block_params["attention/output.weights"] = pz.nx.NamedArray.wrap(
           params[f"layer_{i}/attn/attn_vec_einsum"]["w"]
       ).tag("query_heads", "projection", "embedding")
@@ -466,29 +587,31 @@ def gemma_from_pretrained_checkpoint(
       cur_block_params["attention/query.weights"] = pz.nx.NamedArray.wrap(
           params[f"layer_{i}/attn/qkv_einsum"]["w"][0]
       ).tag("heads", "embedding", "projection")
-      cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
-          params[f"layer_{i}/attn/qkv_einsum"]["w"][1]
-      ).tag("heads", "embedding", "projection")
-      cur_block_params["attention/value.weights"] = pz.nx.NamedArray.wrap(
-          params[f"layer_{i}/attn/qkv_einsum"]["w"][2]
-      ).tag("heads", "embedding", "projection")
+      if not is_kv_shared:
+        cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
+            params[f"layer_{i}/attn/qkv_einsum"]["w"][1]
+        ).tag("heads", "embedding", "projection")
+        cur_block_params["attention/value.weights"] = pz.nx.NamedArray.wrap(
+            params[f"layer_{i}/attn/qkv_einsum"]["w"][2]
+        ).tag("heads", "embedding", "projection")
       cur_block_params["attention/output.weights"] = pz.nx.NamedArray.wrap(
           params[f"layer_{i}/attn/attn_vec_einsum"]["w"]
       ).tag("heads", "projection", "embedding")
     else:
       # Grouped query attention: split attention heads into groups.
-      if layer_k_eq_v:
-        # K=V sharing: only key weights in checkpoint (Gemma 4 global).
-        cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
-            params[f"layer_{i}/attn/k_einsum"]["w"]
-        ).tag("head_groups", "embedding", "projection")
-      else:
-        cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
-            params[f"layer_{i}/attn/kv_einsum"]["w"][0]
-        ).tag("head_groups", "embedding", "projection")
-        cur_block_params["attention/value.weights"] = pz.nx.NamedArray.wrap(
-            params[f"layer_{i}/attn/kv_einsum"]["w"][1]
-        ).tag("head_groups", "embedding", "projection")
+      if not is_kv_shared:
+        if layer_k_eq_v:
+          # K=V sharing: only key weights in checkpoint (Gemma 4 global).
+          cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/attn/k_einsum"]["w"]
+          ).tag("head_groups", "embedding", "projection")
+        else:
+          cur_block_params["attention/key.weights"] = pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/attn/kv_einsum"]["w"][0]
+          ).tag("head_groups", "embedding", "projection")
+          cur_block_params["attention/value.weights"] = pz.nx.NamedArray.wrap(
+              params[f"layer_{i}/attn/kv_einsum"]["w"][1]
+          ).tag("head_groups", "embedding", "projection")
 
       q_weights = params[f"layer_{i}/attn/q_einsum"]["w"]
       out_weights = params[f"layer_{i}/attn/attn_vec_einsum"]["w"]

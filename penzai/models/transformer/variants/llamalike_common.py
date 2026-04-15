@@ -123,6 +123,12 @@ class LlamalikeTransformerConfig:
       (config.rope_wavelength).
     k_eq_v_global: Whether global attention layers share key and value
       projections (K=V). Used by Gemma 4 31B and 26B-A4B.
+    per_layer_input_dim: Dimension of per-layer embeddings (PLE). If None,
+      per-layer embeddings are not used. Used by Gemma 4 E2B and E4B.
+    num_kv_shared_layers: Number of trailing transformer blocks that share
+      key/value projections with earlier blocks. Shared layers reuse the
+      K/V activations from earlier layers of the same attention type,
+      cycling through the non-shared layers. Used by Gemma 4 E2B and E4B.
   """
 
   num_kv_heads: int
@@ -156,6 +162,8 @@ class LlamalikeTransformerConfig:
   global_scale_factor: float | None = None
   local_rope_wavelength: float | None = None
   k_eq_v_global: bool = False
+  per_layer_input_dim: int | None = None
+  num_kv_shared_layers: int = 0
 
 
 def build_llamalike_feedforward(
@@ -243,11 +251,165 @@ def _head_info(num_kv_heads: int, query_head_multiplier: int):
   return (common_head_axes, qkv_einsum, query_only_head_axes, q_einsum)
 
 
+# ---------------------------------------------------------------------------
+# Activation sharing helpers (for KV cache sharing between layers)
+# ---------------------------------------------------------------------------
+
+
+@pz.pytree_dataclass
+class _StoreActivation(pz.nn.Layer):
+  """Runs an inner layer, stores its output in a variable, and returns it.
+
+  Used to wrap K/V pipelines in source attention layers so that shared layers
+  can later read the computed key/value activations.
+  """
+
+  inner: pz.nn.Layer
+  store: pz.StateVariable
+
+  def __call__(self, x, **side_inputs):
+    result = self.inner(x, **side_inputs)
+    self.store.value = result
+    return result
+
+
+@pz.pytree_dataclass
+class _ReadStoredActivation(pz.nn.Layer):
+  """Returns a previously stored activation, ignoring its input.
+
+  Used in shared attention layers to read K/V activations computed by a source
+  layer.
+
+  Attributes:
+    store: StateVariable holding the stored activation (shared with the
+      corresponding ``_StoreActivation``).
+    output_axes: Expected named axes of the output. Stored as metadata so that
+      downstream code (e.g. sampling mode) can infer per-layer cache shapes
+      without needing the inner Linear.
+  """
+
+  store: pz.StateVariable
+  output_axes: dict[str, int] = dataclasses.field(
+      default_factory=dict, metadata={"pytree_node": False}
+  )
+
+  def __call__(self, x, **side_inputs):
+    return self.store.value
+
+
+# ---------------------------------------------------------------------------
+# Per-Layer Embedding (PLE) layers
+# ---------------------------------------------------------------------------
+
+
+@pz.pytree_dataclass
+class PerLayerEmbeddingPrecompute(pz.nn.Layer):
+  """Precomputes per-layer embedding vectors from initial embeddings and tokens.
+
+  This layer sits after the embedding lookup in models with Per-Layer
+  Embeddings (PLE), as used by Gemma 4 E2B and E4B. It computes combined
+  PLE vectors for all layers and stores them in a ``StateVariable`` for later
+  retrieval by ``PerLayerEmbeddingInject`` layers in each block.
+
+  The computation follows the Gemma 4 PLE formula:
+
+  1. **Token-identity**: look up token IDs in the per-layer embedding table,
+     scaled by ``sqrt(per_layer_input_dim)``.
+  2. **Context-aware**: project the initial embedding through a linear, scaled
+     by ``1/sqrt(embedding_dim)``, then RMS-normalize.
+  3. **Combine**: ``(context + tokens) / sqrt(2)``.
+
+  Attributes:
+    per_layer_table: Embedding table with named axes
+      ``{"vocabulary": V, "layers": L, "ple_input": D}``.
+    model_projection: Linear from ``{"embedding": E}`` to
+      ``{"layers": L, "ple_input": D}``.
+    projection_norm: RMSLayerNorm across ``{"ple_input": D}``.
+    ple_store: StateVariable that receives the combined PLE vectors.
+    num_layers: Number of transformer layers.
+    per_layer_input_dim: Dimension of per-layer embeddings.
+    embedding_dim: Dimension of the residual stream.
+    token_ids_input_name: Side input key for token IDs.
+  """
+
+  per_layer_table: parameters.ParameterLike
+  model_projection: pz.nn.Layer
+  projection_norm: pz.nn.Layer
+  ple_store: pz.StateVariable
+  num_layers: int = dataclasses.field(metadata={"pytree_node": False})
+  per_layer_input_dim: int = dataclasses.field(metadata={"pytree_node": False})
+  embedding_dim: int = dataclasses.field(metadata={"pytree_node": False})
+  token_ids_input_name: str = dataclasses.field(
+      default="token_ids", metadata={"pytree_node": False}
+  )
+
+  def __call__(self, embedding, **side_inputs):
+    token_ids = side_inputs[self.token_ids_input_name]
+
+    # Token-identity PLE: look up per-layer embeddings by token ID.
+    # per_layer_table.value has named axes {"vocabulary": V, "layers": L,
+    # "ple_input": D}. NamedArray dictionary indexing handles the lookup.
+    ple_tokens = self.per_layer_table.value[{"vocabulary": token_ids}]
+    scale = jnp.sqrt(
+        jnp.array(self.per_layer_input_dim, dtype=embedding.dtype)
+    )
+    ple_tokens = ple_tokens * scale
+
+    # Context-aware PLE: project the initial embedding.
+    ple_context = self.model_projection(embedding, **side_inputs)
+    inv_sqrt_dim = jnp.array(
+        1.0 / jnp.sqrt(float(self.embedding_dim)), dtype=embedding.dtype
+    )
+    ple_context = ple_context * inv_sqrt_dim
+    ple_context = self.projection_norm(ple_context, **side_inputs)
+
+    # Combine and store for PerLayerEmbeddingInject layers to read.
+    inv_sqrt_2 = jnp.array(1.0 / jnp.sqrt(2.0), dtype=embedding.dtype)
+    self.ple_store.value = (ple_context + ple_tokens) * inv_sqrt_2
+
+    return embedding  # pass through unchanged
+
+
+@pz.pytree_dataclass
+class PerLayerEmbeddingInject(pz.nn.Layer):
+  """Injects per-layer embedding information into the residual stream.
+
+  Reads precomputed PLE vectors from a shared ``StateVariable``, gates them
+  with the current hidden state, projects back to embedding dimension,
+  normalizes, and adds to the residual stream.
+
+  Attributes:
+    ple_store: StateVariable holding precomputed PLE vectors (shared with
+      ``PerLayerEmbeddingPrecompute``).
+    layer_index: Which layer slice to read from the PLE vectors.
+    gate: Linear from ``{"embedding": E}`` to ``{"ple_input": D}``.
+    projection: Linear from ``{"ple_input": D}`` to ``{"embedding": E}``.
+    post_norm: RMSLayerNorm across ``{"embedding": E}``.
+  """
+
+  ple_store: pz.StateVariable
+  layer_index: int = dataclasses.field(metadata={"pytree_node": False})
+  gate: pz.nn.Layer
+  projection: pz.nn.Layer
+  post_norm: pz.nn.Layer
+
+  def __call__(self, hidden_state, **side_inputs):
+    # Read this layer's PLE vector.
+    ple = self.ple_store.value[{"layers": self.layer_index}]
+    # Gate with the current hidden state, then project and normalize.
+    gated = pz.nx.nmap(jax.nn.gelu)(self.gate(hidden_state, **side_inputs)) * ple
+    projected = self.projection(gated, **side_inputs)
+    normed = self.post_norm(projected, **side_inputs)
+    return hidden_state + normed
+
+
 def build_llamalike_attention(
     name: str,
     init_base_rng: jax.Array | None,
     config: LlamalikeTransformerConfig,
     block_index: int | None = None,
+    kv_source_stores: tuple[pz.StateVariable, pz.StateVariable] | None = None,
+    kv_shared_stores: tuple[pz.StateVariable, pz.StateVariable] | None = None,
 ) -> pz.nn.Attention:
   """Builds an attention block from a configuration.
 
@@ -257,6 +419,14 @@ def build_llamalike_attention(
     config: The configuration of the model.
     block_index: The index of the transformer block in the list of blocks. Can
       be None if the attention type doesn't depend on the block index.
+    kv_source_stores: If this is a KV source layer (for KV cache sharing),
+      a tuple of ``(key_store, value_store)`` StateVariables. The K/V
+      activations will be stored here after computation, for later retrieval
+      by shared layers.
+    kv_shared_stores: If this is a KV shared layer, a tuple of
+      ``(key_store, value_store)`` StateVariables pointing to the source
+      layer's stores. K/V activations are read from here instead of being
+      computed.
 
   Returns:
     An Attention block.
@@ -403,59 +573,86 @@ def build_llamalike_attention(
       ),
   ])
 
-  # Build key and value sublayers, with optional K=V sharing for global layers.
-  k_eq_v = is_global and config.k_eq_v_global
+  # Build key and value sublayers.
+  kv_output_axes = {**common_head_axes, "projection": projection_dim}
 
-  kv_linear = pz.nn.Linear.from_config(
-      name=f"{name}/key",
-      init_base_rng=init_base_rng,
-      input_axes={"embedding": embedding_dim},
-      output_axes={**common_head_axes, "projection": projection_dim},
-      dtype=config.parameter_dtype,
-  )
-
-  input_to_key_sublayers = [kv_linear]
-  if config.use_qk_norm:
-    input_to_key_sublayers.append(
-        pz.nn.RMSLayerNorm.from_config(
-            name=f"{name}/key_norm",
-            init_base_rng=init_base_rng,
-            across_axes={"projection": projection_dim},
-            dtype=config.parameter_dtype,
-            epsilon=config.rms_norm_eps,
-        ),
+  if kv_shared_stores is not None:
+    # KV shared layer: read K/V activations from a source layer's stores.
+    input_to_key = _ReadStoredActivation(
+        store=kv_shared_stores[0], output_axes=kv_output_axes
     )
-  input_to_key_sublayers.append(_make_rope_layer())
-
-  if k_eq_v:
-    # K=V sharing: reuse the same Linear for both key and value,
-    # following the embedding-tying pattern.
-    input_to_value_sublayers = [kv_linear]
+    input_to_value = _ReadStoredActivation(
+        store=kv_shared_stores[1], output_axes=kv_output_axes
+    )
   else:
-    input_to_value_sublayers = [
-        pz.nn.Linear.from_config(
-            name=f"{name}/value",
-            init_base_rng=init_base_rng,
-            input_axes={"embedding": embedding_dim},
-            output_axes={**common_head_axes, "projection": projection_dim},
-            dtype=config.parameter_dtype,
-        ),
-    ]
-  if config.use_value_norm:
-    input_to_value_sublayers.append(
-        pz.nn.RMSLayerNorm.from_config(
-            name=f"{name}/value_norm",
-            init_base_rng=init_base_rng,
-            across_axes={"projection": projection_dim},
-            dtype=config.parameter_dtype,
-            epsilon=config.rms_norm_eps,
-        ),
+    # Build K/V projections normally.
+    k_eq_v = is_global and config.k_eq_v_global
+
+    kv_linear = pz.nn.Linear.from_config(
+        name=f"{name}/key",
+        init_base_rng=init_base_rng,
+        input_axes={"embedding": embedding_dim},
+        output_axes=kv_output_axes,
+        dtype=config.parameter_dtype,
     )
+
+    input_to_key_sublayers = [kv_linear]
+    if config.use_qk_norm:
+      input_to_key_sublayers.append(
+          pz.nn.RMSLayerNorm.from_config(
+              name=f"{name}/key_norm",
+              init_base_rng=init_base_rng,
+              across_axes={"projection": projection_dim},
+              dtype=config.parameter_dtype,
+              epsilon=config.rms_norm_eps,
+          ),
+      )
+    input_to_key_sublayers.append(_make_rope_layer())
+
+    if k_eq_v:
+      # K=V sharing: reuse the same Linear for both key and value,
+      # following the embedding-tying pattern.
+      input_to_value_sublayers = [kv_linear]
+    else:
+      input_to_value_sublayers = [
+          pz.nn.Linear.from_config(
+              name=f"{name}/value",
+              init_base_rng=init_base_rng,
+              input_axes={"embedding": embedding_dim},
+              output_axes=kv_output_axes,
+              dtype=config.parameter_dtype,
+          ),
+      ]
+    if config.use_value_norm:
+      input_to_value_sublayers.append(
+          pz.nn.RMSLayerNorm.from_config(
+              name=f"{name}/value_norm",
+              init_base_rng=init_base_rng,
+              across_axes={"projection": projection_dim},
+              dtype=config.parameter_dtype,
+              epsilon=config.rms_norm_eps,
+          ),
+      )
+
+    key_seq = pz.nn.Sequential(input_to_key_sublayers)
+    value_seq = pz.nn.Sequential(input_to_value_sublayers)
+
+    if kv_source_stores is not None:
+      # KV source layer: wrap K/V pipelines to store activations.
+      input_to_key = _StoreActivation(
+          inner=key_seq, store=kv_source_stores[0]
+      )
+      input_to_value = _StoreActivation(
+          inner=value_seq, store=kv_source_stores[1]
+      )
+    else:
+      input_to_key = key_seq
+      input_to_value = value_seq
 
   return pz.nn.Attention(
       input_to_query=pz.nn.Sequential(input_to_query_sublayers),
-      input_to_key=pz.nn.Sequential(input_to_key_sublayers),
-      input_to_value=pz.nn.Sequential(input_to_value_sublayers),
+      input_to_key=input_to_key,
+      input_to_value=input_to_value,
       query_key_to_attn=pz.nn.Sequential(query_key_to_attn_sublayers),
       attn_value_to_output=pz.nn.Sequential([
           pz.nn.NamedEinsum(
@@ -485,6 +682,9 @@ def build_llamalike_block(
     init_base_rng: jax.Array | None,
     config: LlamalikeTransformerConfig,
     block_index: int | None = None,
+    kv_source_stores: tuple[pz.StateVariable, pz.StateVariable] | None = None,
+    kv_shared_stores: tuple[pz.StateVariable, pz.StateVariable] | None = None,
+    ple_store: pz.StateVariable | None = None,
 ) -> model_parts.TransformerBlock:
   """Builds a transformer block from a configuration.
 
@@ -494,6 +694,12 @@ def build_llamalike_block(
     config: The configuration of the model.
     block_index: The index of the transformer block in the list of blocks. Can
       be None if the attention type doesn't depend on the block index.
+    kv_source_stores: If this is a KV source layer, ``(key_store, value_store)``
+      StateVariables to store K/V activations.
+    kv_shared_stores: If this is a KV shared layer, ``(key_store, value_store)``
+      StateVariables to read source K/V from.
+    ple_store: StateVariable holding precomputed PLE vectors. If provided, a
+      ``PerLayerEmbeddingInject`` layer is appended to this block.
 
   Returns:
     A full transformer block.
@@ -511,6 +717,8 @@ def build_llamalike_block(
           init_base_rng,
           config,
           block_index=block_index,
+          kv_source_stores=kv_source_stores,
+          kv_shared_stores=kv_shared_stores,
       ),
   ]
   if config.use_post_attn_norm:
@@ -556,12 +764,42 @@ def build_llamalike_block(
   else:
     attn_residual = pz.nn.Residual(attn_delta)
 
-  return model_parts.TransformerBlock(
-      sublayers=[
-          attn_residual,
-          pz.nn.Residual(pz.nn.Sequential(ffw_sequence)),
-      ],
-  )
+  block_sublayers = [
+      attn_residual,
+      pz.nn.Residual(pz.nn.Sequential(ffw_sequence)),
+  ]
+
+  # Add per-layer embedding injection if enabled.
+  if ple_store is not None and config.per_layer_input_dim is not None:
+    block_sublayers.append(
+        PerLayerEmbeddingInject(
+            ple_store=ple_store,
+            layer_index=block_index,
+            gate=pz.nn.Linear.from_config(
+                name=f"{name}/per_layer_input_gate",
+                init_base_rng=init_base_rng,
+                input_axes={"embedding": config.embedding_dim},
+                output_axes={"ple_input": config.per_layer_input_dim},
+                dtype=config.parameter_dtype,
+            ),
+            projection=pz.nn.Linear.from_config(
+                name=f"{name}/per_layer_projection",
+                init_base_rng=init_base_rng,
+                input_axes={"ple_input": config.per_layer_input_dim},
+                output_axes={"embedding": config.embedding_dim},
+                dtype=config.parameter_dtype,
+            ),
+            post_norm=pz.nn.RMSLayerNorm.from_config(
+                name=f"{name}/post_per_layer_input_norm",
+                init_base_rng=init_base_rng,
+                across_axes={"embedding": config.embedding_dim},
+                dtype=config.parameter_dtype,
+                epsilon=config.rms_norm_eps,
+            ),
+        )
+    )
+
+  return model_parts.TransformerBlock(sublayers=block_sublayers)
 
 
 def build_llamalike_transformer(
@@ -600,10 +838,93 @@ def build_llamalike_transformer(
         )
     )
 
+  # Set up per-layer embeddings (PLE) if enabled.
+  ple_store = None
+  per_layer_input_dim = config.per_layer_input_dim
+  if per_layer_input_dim is not None:
+    ple_store = pz.StateVariable(value=None, label=f"{name}/ple_store")
+    sublayers.append(
+        PerLayerEmbeddingPrecompute(
+            per_layer_table=parameters.make_parameter(
+                f"{name}/embedder/per_layer_embeddings",
+                init_base_rng,
+                lambda rng: pz.nx.wrap(
+                    jax.random.normal(
+                        rng,
+                        (
+                            config.vocab_size,
+                            config.num_decoder_blocks,
+                            per_layer_input_dim,
+                        ),
+                        dtype=config.parameter_dtype,
+                    )
+                    * 0.01
+                ).tag("vocabulary", "layers", "ple_input"),
+            ),
+            model_projection=pz.nn.Linear.from_config(
+                name=f"{name}/embedder/per_layer_model_projection",
+                init_base_rng=init_base_rng,
+                input_axes={"embedding": config.embedding_dim},
+                output_axes={
+                    "layers": config.num_decoder_blocks,
+                    "ple_input": per_layer_input_dim,
+                },
+                dtype=config.parameter_dtype,
+            ),
+            projection_norm=pz.nn.RMSLayerNorm.from_config(
+                name=f"{name}/embedder/per_layer_projection_norm",
+                init_base_rng=init_base_rng,
+                across_axes={"ple_input": per_layer_input_dim},
+                dtype=config.parameter_dtype,
+                epsilon=config.rms_norm_eps,
+            ),
+            ple_store=ple_store,
+            num_layers=config.num_decoder_blocks,
+            per_layer_input_dim=per_layer_input_dim,
+            embedding_dim=config.embedding_dim,
+        )
+    )
+
+  # Set up KV cache sharing if enabled.
+  kv_stores: dict[int, tuple[pz.StateVariable, pz.StateVariable]] = {}
+  kv_source_map: dict[int, int] = {}
+  if config.num_kv_shared_layers > 0:
+    num_non_shared = config.num_decoder_blocks - config.num_kv_shared_layers
+    # Resolve per-layer attention types.
+    if isinstance(config.attention_type, AttentionType):
+      attn_types = [config.attention_type] * config.num_decoder_blocks
+    else:
+      attn_types = [
+          config.attention_type[i % len(config.attention_type)]
+          for i in range(config.num_decoder_blocks)
+      ]
+    # Create KV stores for non-shared (source) layers.
+    for i in range(num_non_shared):
+      kv_stores[i] = (
+          pz.StateVariable(value=None, label=f"{name}/kv_key_{i}"),
+          pz.StateVariable(value=None, label=f"{name}/kv_value_{i}"),
+      )
+    # Map shared layers to source layers, cycling by attention type.
+    non_shared_by_type: dict[str, list[int]] = {}
+    for i in range(num_non_shared):
+      type_key = type(attn_types[i]).__name__
+      non_shared_by_type.setdefault(type_key, []).append(i)
+    shared_counters = {k: 0 for k in non_shared_by_type}
+    for j in range(num_non_shared, config.num_decoder_blocks):
+      type_key = type(attn_types[j]).__name__
+      sources = non_shared_by_type[type_key]
+      source_idx = sources[shared_counters[type_key] % len(sources)]
+      kv_source_map[j] = source_idx
+      shared_counters[type_key] += 1
+
   if config.use_layer_stack:
     if not isinstance(config.attention_type, AttentionType):
       raise ValueError(
           "Layer stack does not currently support per-layer attention types."
+      )
+    if config.num_kv_shared_layers > 0:
+      raise ValueError(
+          "Layer stack does not currently support KV cache sharing."
       )
     sublayers.append(
         pz.nn.LayerStack.from_sublayer_builder(
@@ -611,7 +932,9 @@ def build_llamalike_transformer(
             stack_axis="blocks",
             stack_axis_size=config.num_decoder_blocks,
             init_base_rng=init_base_rng,
-            builder_kwargs=dict(name=f"{name}/blocks", config=config),
+            builder_kwargs=dict(
+                name=f"{name}/blocks", config=config, ple_store=ple_store
+            ),
         )
     )
   else:
@@ -622,9 +945,23 @@ def build_llamalike_transformer(
             " number of blocks."
         )
     for block_index in range(config.num_decoder_blocks):
+      # Determine KV sharing role for this block.
+      block_kv_source = None
+      block_kv_shared = None
+      if block_index in kv_stores:
+        block_kv_source = kv_stores[block_index]
+      elif block_index in kv_source_map:
+        block_kv_shared = kv_stores[kv_source_map[block_index]]
+
       sublayers.append(
           build_llamalike_block(
-              f"{name}/block_{block_index}", init_base_rng, config, block_index
+              f"{name}/block_{block_index}",
+              init_base_rng,
+              config,
+              block_index,
+              kv_source_stores=block_kv_source,
+              kv_shared_stores=block_kv_shared,
+              ple_store=ple_store,
           )
       )
 

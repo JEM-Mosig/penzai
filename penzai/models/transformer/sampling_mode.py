@@ -131,6 +131,7 @@ class KVCachingTransformerLM(pz.nn.Layer):
         token_positions=query_positions,
         kv_token_positions=key_value_positions,
         cache_end_index=self.cache_end_index.value,
+        token_ids=tokens,
         **extra_side_inputs,
     )
     # Update the state variables.
@@ -206,6 +207,12 @@ class KVCachingTransformerLM(pz.nn.Layer):
       )
       if key_linears:
         cached_axes = {**batch_axes, **key_linears[0].output_axes}
+      elif (
+          hasattr(attn.input_to_key, "output_axes")
+          and attn.input_to_key.output_axes  # type: ignore[union-attr]
+      ):
+        # Shared-KV layers store expected axes as metadata.
+        cached_axes = {**batch_axes, **attn.input_to_key.output_axes}  # type: ignore[union-attr]
       else:
         cached_axes = default_cached_axes
 

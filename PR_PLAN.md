@@ -129,7 +129,9 @@ All 16 tests pass (14 existing + 2 new).
 
 ---
 
-## Phase B: gemma4\_E2B + gemma4\_E4B (Per-Layer Embeddings + KV Cache Sharing)
+## Phase B: gemma4\_E2B + gemma4\_E4B (Per-Layer Embeddings + KV Cache Sharing)  ✅ DONE
+
+All changes landed and tested (18/18 tests pass, 0 new type errors).
 
 ### B1. Per-Layer Embedding layer
 
