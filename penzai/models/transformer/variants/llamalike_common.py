@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 from penzai import pz
 from penzai.models.transformer import model_parts
+from penzai.nn import mixture_of_experts
 from penzai.nn import parameters
 
 
@@ -129,6 +130,12 @@ class LlamalikeTransformerConfig:
       key/value projections with earlier blocks. Shared layers reuse the
       K/V activations from earlier layers of the same attention type,
       cycling through the non-shared layers. Used by Gemma 4 E2B and E4B.
+    num_experts: Number of experts for Mixture of Experts layers. If None,
+      standard dense feedforward is used. Used by Gemma 4 26B-A4B.
+    num_selected_experts: Number of experts selected per token (top-k).
+      Required when ``num_experts`` is set.
+    expert_hidden_dim: Hidden dimension for per-expert MLPs. Required when
+      ``num_experts`` is set. The dense shared branch uses ``mlp_hidden_dim``.
   """
 
   num_kv_heads: int
@@ -164,6 +171,9 @@ class LlamalikeTransformerConfig:
   k_eq_v_global: bool = False
   per_layer_input_dim: int | None = None
   num_kv_shared_layers: int = 0
+  num_experts: int | None = None
+  num_selected_experts: int | None = None
+  expert_hidden_dim: int | None = None
 
 
 def build_llamalike_feedforward(
@@ -227,6 +237,164 @@ def build_llamalike_feedforward(
           input_axes={"neurons": config.mlp_hidden_dim},
           output_axes={"embedding": config.embedding_dim},
           dtype=config.parameter_dtype,
+      ),
+  ])
+
+
+def build_moe_feedforward(
+    name: str,
+    init_base_rng: jax.Array | None,
+    config: LlamalikeTransformerConfig,
+) -> model_parts.TransformerMoEFeedForward:
+  """Creates a dual-branch MoE + dense feedforward block.
+
+  Builds the Gemma 4 MoE architecture: a dense shared MLP branch and a MoE
+  branch are run in parallel, their outputs summed, then a final norm is
+  applied.
+
+  Args:
+    name: Name of the feedforward block.
+    init_base_rng: Base RNG for initializing the parameters.
+    config: The configuration of the model. Must have ``num_experts``,
+      ``num_selected_experts``, and ``expert_hidden_dim`` set.
+
+  Returns:
+    An instance of TransformerMoEFeedForward.
+  """
+  assert config.num_experts is not None
+  assert config.num_selected_experts is not None
+  assert config.expert_hidden_dim is not None
+
+  embedding_dim = config.embedding_dim
+  num_experts = config.num_experts
+  num_selected = config.num_selected_experts
+  expert_dim = config.expert_hidden_dim
+
+  # Build the MoE layer.
+  moe_layer = mixture_of_experts.MixtureOfExperts(
+      input_to_routing=mixture_of_experts.MoETopKRouter(
+          router_norm=pz.nn.RMSStandardize(
+              across="embedding", epsilon=config.rms_norm_eps
+          ),
+          router_scale=parameters.make_parameter(
+              f"{name}/mlp/router.scale",
+              init_base_rng,
+              lambda rng: pz.nx.wrap(
+                  jnp.ones(embedding_dim, dtype=config.parameter_dtype)
+              ).tag("embedding"),
+          ),
+          router_logits=pz.nn.Linear.from_config(
+              name=f"{name}/mlp/router_logits",
+              init_base_rng=init_base_rng,
+              input_axes={"embedding": embedding_dim},
+              output_axes={"experts": num_experts},
+              dtype=config.parameter_dtype,
+          ),
+          per_expert_scale=parameters.make_parameter(
+              f"{name}/mlp/per_expert.scale",
+              init_base_rng,
+              lambda rng: pz.nx.wrap(
+                  jnp.ones(num_experts, dtype=config.parameter_dtype)
+              ).tag("experts"),
+          ),
+          num_selected_experts=num_selected,
+          embedding_dim=embedding_dim,
+      ),
+      input_and_routing_to_output=mixture_of_experts.MoEGatedExpertComputation(
+          gating_weights=parameters.make_parameter(
+              f"{name}/mlp/gating.weights",
+              init_base_rng,
+              lambda rng: pz.nx.wrap(
+                  jax.random.normal(
+                      rng,
+                      (num_experts, expert_dim, embedding_dim),
+                      dtype=config.parameter_dtype,
+                  )
+                  * 0.01
+              ).tag("experts", "neurons", "embedding"),
+          ),
+          value_weights=parameters.make_parameter(
+              f"{name}/mlp/value.weights",
+              init_base_rng,
+              lambda rng: pz.nx.wrap(
+                  jax.random.normal(
+                      rng,
+                      (num_experts, expert_dim, embedding_dim),
+                      dtype=config.parameter_dtype,
+                  )
+                  * 0.01
+              ).tag("experts", "neurons", "embedding"),
+          ),
+          out_weights=parameters.make_parameter(
+              f"{name}/mlp/out.weights",
+              init_base_rng,
+              lambda rng: pz.nx.wrap(
+                  jax.random.normal(
+                      rng,
+                      (num_experts, embedding_dim, expert_dim),
+                      dtype=config.parameter_dtype,
+                  )
+                  * 0.01
+              ).tag("experts", "embedding", "neurons"),
+          ),
+          num_selected_experts=num_selected,
+      ),
+  )
+
+  # Dual-branch structure: dense + MoE, summed, then final norm.
+  return model_parts.TransformerMoEFeedForward([
+      pz.nn.BranchAndAddTogether(
+          branches=[
+              pz.nn.NamedGroup(
+                  "dense_branch",
+                  [
+                      pz.nn.RMSLayerNorm.from_config(
+                          name=f"{name}/pre_ffw_norm",
+                          init_base_rng=init_base_rng,
+                          across_axes={"embedding": embedding_dim},
+                          dtype=config.parameter_dtype,
+                          epsilon=config.rms_norm_eps,
+                      ),
+                      build_llamalike_feedforward(
+                          f"{name}/mlp2", init_base_rng, config
+                      ),
+                      pz.nn.RMSLayerNorm.from_config(
+                          name=f"{name}/post_ffw1_norm",
+                          init_base_rng=init_base_rng,
+                          across_axes={"embedding": embedding_dim},
+                          dtype=config.parameter_dtype,
+                          epsilon=config.rms_norm_eps,
+                      ),
+                  ],
+              ),
+              pz.nn.NamedGroup(
+                  "moe_branch",
+                  [
+                      pz.nn.RMSLayerNorm.from_config(
+                          name=f"{name}/pre_ffw2_norm",
+                          init_base_rng=init_base_rng,
+                          across_axes={"embedding": embedding_dim},
+                          dtype=config.parameter_dtype,
+                          epsilon=config.rms_norm_eps,
+                      ),
+                      moe_layer,
+                      pz.nn.RMSLayerNorm.from_config(
+                          name=f"{name}/post_ffw2_norm",
+                          init_base_rng=init_base_rng,
+                          across_axes={"embedding": embedding_dim},
+                          dtype=config.parameter_dtype,
+                          epsilon=config.rms_norm_eps,
+                      ),
+                  ],
+              ),
+          ]
+      ),
+      pz.nn.RMSLayerNorm.from_config(
+          name=f"{name}/post_ffw_norm",
+          init_base_rng=init_base_rng,
+          across_axes={"embedding": embedding_dim},
+          dtype=config.parameter_dtype,
+          epsilon=config.rms_norm_eps,
       ),
   ])
 
@@ -731,26 +899,31 @@ def build_llamalike_block(
             epsilon=config.rms_norm_eps,
         )
     )
-  ffw_sequence = [
-      pz.nn.RMSLayerNorm.from_config(
-          name=f"{name}/pre_ffw_norm",
-          init_base_rng=init_base_rng,
-          across_axes={"embedding": config.embedding_dim},
-          dtype=config.parameter_dtype,
-          epsilon=config.rms_norm_eps,
-      ),
-      build_llamalike_feedforward(f"{name}/mlp", init_base_rng, config),
-  ]
-  if config.use_post_ffw_norm:
-    ffw_sequence.append(
+  if config.num_experts is not None:
+    # MoE feedforward: dual-branch (dense + MoE) with its own norms.
+    ffw_layer = build_moe_feedforward(name, init_base_rng, config)
+  else:
+    ffw_sequence = [
         pz.nn.RMSLayerNorm.from_config(
-            name=f"{name}/post_ffw_norm",
+            name=f"{name}/pre_ffw_norm",
             init_base_rng=init_base_rng,
             across_axes={"embedding": config.embedding_dim},
             dtype=config.parameter_dtype,
             epsilon=config.rms_norm_eps,
-        )
-    )
+        ),
+        build_llamalike_feedforward(f"{name}/mlp", init_base_rng, config),
+    ]
+    if config.use_post_ffw_norm:
+      ffw_sequence.append(
+          pz.nn.RMSLayerNorm.from_config(
+              name=f"{name}/post_ffw_norm",
+              init_base_rng=init_base_rng,
+              across_axes={"embedding": config.embedding_dim},
+              dtype=config.parameter_dtype,
+              epsilon=config.rms_norm_eps,
+          )
+      )
+    ffw_layer = pz.nn.Sequential(ffw_sequence)
   attn_delta = pz.nn.Sequential(attn_sequence)
   if config.use_skip_scale:
     attn_residual = pz.nn.ScaledResidual(
@@ -766,7 +939,7 @@ def build_llamalike_block(
 
   block_sublayers = [
       attn_residual,
-      pz.nn.Residual(pz.nn.Sequential(ffw_sequence)),
+      pz.nn.Residual(ffw_layer),
   ]
 
   # Add per-layer embedding injection if enabled.

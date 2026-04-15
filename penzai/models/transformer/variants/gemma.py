@@ -284,6 +284,35 @@ _GEMMA_PRESETS = {
         per_layer_input_dim=256,
         num_kv_shared_layers=18,
     ),
+    "gemma4_26b_a4b": dict(
+        num_decoder_blocks=30,
+        vocab_size=262_144,
+        num_kv_heads=8,
+        global_num_kv_heads=2,
+        query_head_multiplier=2,
+        embedding_dim=2816,
+        projection_dim=256,
+        global_projection_dim=512,
+        mlp_hidden_dim=2_112,
+        attention_type=_make_attention_layers_types(
+            pattern=(llamalike_common.AttentionTypeSlidingWindowCausal(1024),)
+            * 5
+            + (llamalike_common.AttentionTypeGlobalCausal(),),
+            num_layers=30,
+        ),
+        use_qk_norm=True,
+        use_value_norm=True,
+        use_post_attn_norm=True,
+        use_post_ffw_norm=True,
+        use_skip_scale=True,
+        k_eq_v_global=True,
+        global_rope_proportion=0.25,
+        rope_wavelength=1_000_000,
+        local_rope_wavelength=10_000,
+        num_experts=128,
+        num_selected_experts=8,
+        expert_hidden_dim=704,
+    ),
 }
 _NEEDS_GATING_TRANSPOSE = {
     "gemma_2b": False,
@@ -298,6 +327,7 @@ _NEEDS_GATING_TRANSPOSE = {
     "gemma4_31b": True,
     "gemma4_e2b": True,
     "gemma4_e4b": True,
+    "gemma4_26b_a4b": True,
 }
 
 
@@ -318,6 +348,7 @@ def gemma_from_pretrained_checkpoint(
         "gemma4_31b",
         "gemma4_e2b",
         "gemma4_e4b",
+        "gemma4_26b_a4b",
         "auto",
     ] = "auto",
 ) -> model_parts.TransformerLM:
@@ -360,6 +391,7 @@ def gemma_from_pretrained_checkpoint(
     )
     has_skip_scale = "layer_0/skip_scale" in params
     has_ple = "embedder/per_layer_embeddings" in params
+    has_moe = "layer_0/mlp/per_expert_scale" in params
     is_match = False
     for gemma_preset_name, kwargs in _GEMMA_PRESETS.items():
       if kwargs["num_decoder_blocks"] != num_layers:
@@ -372,9 +404,13 @@ def gemma_from_pretrained_checkpoint(
       preset_has_skip_scale = kwargs.get("use_skip_scale", False)
       if has_skip_scale != preset_has_skip_scale:
         continue
-      # Match PLE presence (distinguishes E2B/E4B from 31B).
+      # Match PLE presence (distinguishes E2B/E4B from 31B/26B-A4B).
       preset_has_ple = kwargs.get("per_layer_input_dim") is not None
       if has_ple != preset_has_ple:
+        continue
+      # Match MoE presence (distinguishes 26B-A4B from dense models).
+      preset_has_moe = kwargs.get("num_experts") is not None
+      if has_moe != preset_has_moe:
         continue
       is_match = True
       preset_name = gemma_preset_name
@@ -383,7 +419,7 @@ def gemma_from_pretrained_checkpoint(
       raise ValueError(
           f"Could not determine preset for model with {num_layers} layers,"
           f" qk norm {qk_norm}, skip scale {has_skip_scale},"
-          f" ple {has_ple}."
+          f" ple {has_ple}, moe {has_moe}."
       )
 
   preset_kwargs = _GEMMA_PRESETS[preset_name]
@@ -501,19 +537,74 @@ def gemma_from_pretrained_checkpoint(
           1 + params[f"layer_{i}/post_ffw_norm"]["scale"]
       ).tag("embedding")
 
-    gating_einsum_w = params[f"layer_{i}/mlp/gating_einsum"]["w"]
-    if preset_needs_gating_transpose:
-      gating_einsum_w = gating_einsum_w.transpose((0, 2, 1))
-    cur_block_params["mlp/gating_linear.weights"] = pz.nx.NamedArray.wrap(
-        gating_einsum_w[0]
-    ).tag("embedding", "neurons")
-    cur_block_params["mlp/value_linear.weights"] = pz.nx.NamedArray.wrap(
-        gating_einsum_w[1]
-    ).tag("embedding", "neurons")
+    if config.num_experts is not None:
+      # MoE block: load expert weights and router, plus dense shared branch.
+      # Expert gating+value: [experts, 2, neurons, embedding].
+      moe_gating = params[f"layer_{i}/mlp/gating_einsum"]["w"]
+      if preset_needs_gating_transpose:
+        moe_gating = moe_gating.transpose((0, 1, 3, 2))
+      cur_block_params["mlp/gating.weights"] = pz.nx.NamedArray.wrap(
+          moe_gating[:, 0, :, :]
+      ).tag("experts", "neurons", "embedding")
+      cur_block_params["mlp/value.weights"] = pz.nx.NamedArray.wrap(
+          moe_gating[:, 1, :, :]
+      ).tag("experts", "neurons", "embedding")
+      cur_block_params["mlp/out.weights"] = pz.nx.NamedArray.wrap(
+          params[f"layer_{i}/mlp/linear"]["w"]
+      ).tag("experts", "embedding", "neurons")
+      cur_block_params["mlp/per_expert.scale"] = pz.nx.NamedArray.wrap(
+          params[f"layer_{i}/mlp/per_expert_scale"]
+      ).tag("experts")
+      # Router.
+      cur_block_params["mlp/router_logits.weights"] = pz.nx.NamedArray.wrap(
+          params[f"layer_{i}/mlp/router_logits"]["w"]
+      ).tag("embedding", "experts")
+      cur_block_params["mlp/router.scale"] = pz.nx.NamedArray.wrap(
+          params[f"layer_{i}/mlp/router_scale"]
+      ).tag("embedding")
+      # Dense shared branch (mlp2).
+      dense_gating_w = params[f"layer_{i}/mlp2/gating_einsum"]["w"]
+      if preset_needs_gating_transpose:
+        dense_gating_w = dense_gating_w.transpose((0, 2, 1))
+      cur_block_params["mlp2/gating_linear.weights"] = (
+          pz.nx.NamedArray.wrap(dense_gating_w[0]).tag("embedding", "neurons")
+      )
+      cur_block_params["mlp2/value_linear.weights"] = (
+          pz.nx.NamedArray.wrap(dense_gating_w[1]).tag("embedding", "neurons")
+      )
+      cur_block_params["mlp2/out_linear.weights"] = pz.nx.NamedArray.wrap(
+          params[f"layer_{i}/mlp2/linear"]["w"]
+      ).tag("neurons", "embedding")
+      # Additional norms for MoE dual-branch structure.
+      cur_block_params["pre_ffw2_norm/scale.weights"] = (
+          pz.nx.NamedArray.wrap(
+              1 + params[f"layer_{i}/pre_ffw2_norm"]["scale"]
+          ).tag("embedding")
+      )
+      cur_block_params["post_ffw1_norm/scale.weights"] = (
+          pz.nx.NamedArray.wrap(
+              1 + params[f"layer_{i}/post_ffw1_norm"]["scale"]
+          ).tag("embedding")
+      )
+      cur_block_params["post_ffw2_norm/scale.weights"] = (
+          pz.nx.NamedArray.wrap(
+              1 + params[f"layer_{i}/post_ffw2_norm"]["scale"]
+          ).tag("embedding")
+      )
+    else:
+      gating_einsum_w = params[f"layer_{i}/mlp/gating_einsum"]["w"]
+      if preset_needs_gating_transpose:
+        gating_einsum_w = gating_einsum_w.transpose((0, 2, 1))
+      cur_block_params["mlp/gating_linear.weights"] = pz.nx.NamedArray.wrap(
+          gating_einsum_w[0]
+      ).tag("embedding", "neurons")
+      cur_block_params["mlp/value_linear.weights"] = pz.nx.NamedArray.wrap(
+          gating_einsum_w[1]
+      ).tag("embedding", "neurons")
 
-    cur_block_params["mlp/out_linear.weights"] = pz.nx.NamedArray.wrap(
-        params[f"layer_{i}/mlp/linear"]["w"]
-    ).tag("neurons", "embedding")
+      cur_block_params["mlp/out_linear.weights"] = pz.nx.NamedArray.wrap(
+          params[f"layer_{i}/mlp/linear"]["w"]
+      ).tag("neurons", "embedding")
 
     # Determine per-layer attention dimensions for this block.
     if isinstance(config.attention_type, llamalike_common.AttentionType):

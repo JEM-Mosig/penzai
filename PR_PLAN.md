@@ -236,7 +236,9 @@ Checkpoint loader extended for PLE weights:
 
 ---
 
-## Phase C: gemma4\_26b\_a4b (Mixture of Experts)
+## Phase C: gemma4\_26b\_a4b (Mixture of Experts)  ✅ DONE
+
+All changes landed and tested (20/20 tests pass, 0 new type errors).
 
 ### C1. MoE dataflow combinator
 

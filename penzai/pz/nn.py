@@ -40,6 +40,11 @@ from penzai.nn.dropout import (
     maybe_dropout,
     StochasticDropout,
 )
+from penzai.nn.mixture_of_experts import (
+    MixtureOfExperts,
+    MoETopKRouter,
+    MoEGatedExpertComputation,
+)
 from penzai.nn.embeddings import (
     EmbeddingTable,
     EmbeddingLookup,
