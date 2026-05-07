@@ -108,8 +108,17 @@ class LlamalikeTransformerConfig:
     use_qk_norm: Whether to use QK normalization.
     use_value_norm: Whether to use value normalization (RMSNorm on value
       projections, used by Gemma 4).
-    use_skip_scale: Whether to use a learnable scale factor on the attention
-      skip connection (used by Gemma 4).
+    value_norm_with_scale: Whether the value normalization includes a learnable
+      scale parameter. When False (Gemma 4), value normalization is a pure
+      RMS standardization with no parameters. Only meaningful when
+      ``use_value_norm`` is True.
+    use_skip_scale: Whether to multiply each transformer block's output by a
+      learnable scalar (used by Gemma 4).
+    scale_plus_one_at_load: How RMSNorm scales are stored in the source
+      checkpoint. If True (Gemma 1/2/3), the checkpoint stores
+      ``actual_scale - 1`` and the loader adds 1 before binding. If False
+      (Gemma 4), the checkpoint stores the actual scale value and is loaded
+      as-is. The runtime ``RMSLayerNorm`` always applies ``x * scale``.
     global_projection_dim: Projection dimension for global attention layers.
       If None, uses the same projection_dim as local layers.
     global_num_kv_heads: Number of KV heads for global attention layers.
@@ -162,7 +171,9 @@ class LlamalikeTransformerConfig:
   use_layer_stack: bool = False
   use_qk_norm: bool = False
   use_value_norm: bool = False
+  value_norm_with_scale: bool = True
   use_skip_scale: bool = False
+  scale_plus_one_at_load: bool = True
   global_projection_dim: int | None = None
   global_num_kv_heads: int | None = None
   global_rope_proportion: float | None = None
@@ -664,28 +675,24 @@ def build_llamalike_attention(
     raise ValueError(f"Unsupported attention type {attention_type}")
 
   # Decide whether to use full or partial RoPE for this layer.
-  rope_proportion = config.global_rope_proportion if is_global else None
-  if rope_proportion is not None and rope_proportion < 1.0:
-    rope_subset_size = int(projection_dim * rope_proportion)
-  else:
-    rope_subset_size = None
+  # Gemma 4 partial RoPE follows a zero-padded-frequency convention (rotate
+  # all split-half pairs but with timescale=inf for the last
+  # ``(1-rope_proportion)*head_dim/2`` pairs, which yields identity). This is
+  # different from the prefix-slice convention of ``ApplyRoPEToSubset``.
+  layer_rope_proportion = (
+      config.global_rope_proportion if is_global else None
+  )
+  if layer_rope_proportion is None:
+    layer_rope_proportion = 1.0
 
   def _make_rope_layer():
-    if rope_subset_size is not None:
-      return pz.nn.ApplyRoPEToSubset(
-          positions_input_name="token_positions",
-          embedding_axis="projection",
-          max_wavelength=wavelength,
-          rope_subset_size=rope_subset_size,
-          scale_factor=scale_factor,
-      )
-    else:
-      return pz.nn.ApplyRoPE(
-          positions_input_name="token_positions",
-          embedding_axis="projection",
-          max_wavelength=wavelength,
-          scale_factor=scale_factor,
-      )
+    return pz.nn.ApplyRoPE(
+        positions_input_name="token_positions",
+        embedding_axis="projection",
+        max_wavelength=wavelength,
+        scale_factor=scale_factor,
+        rope_proportion=layer_rope_proportion,
+    )
 
   # Build query-key attention scoring sublayers.
   query_key_to_attn_sublayers = [
@@ -792,15 +799,25 @@ def build_llamalike_attention(
           ),
       ]
     if config.use_value_norm:
-      input_to_value_sublayers.append(
-          pz.nn.RMSLayerNorm.from_config(
-              name=f"{name}/value_norm",
-              init_base_rng=init_base_rng,
-              across_axes={"projection": projection_dim},
-              dtype=config.parameter_dtype,
-              epsilon=config.rms_norm_eps,
-          ),
-      )
+      if config.value_norm_with_scale:
+        input_to_value_sublayers.append(
+            pz.nn.RMSLayerNorm.from_config(
+                name=f"{name}/value_norm",
+                init_base_rng=init_base_rng,
+                across_axes={"projection": projection_dim},
+                dtype=config.parameter_dtype,
+                epsilon=config.rms_norm_eps,
+            ),
+        )
+      else:
+        input_to_value_sublayers.append(
+            pz.nn.RMSStandardize(
+                across=("projection",),
+                epsilon=jnp.asarray(
+                    config.rms_norm_eps, dtype=config.parameter_dtype
+                ),
+            ),
+        )
 
     key_seq = pz.nn.Sequential(input_to_key_sublayers)
     value_seq = pz.nn.Sequential(input_to_value_sublayers)
@@ -925,20 +942,8 @@ def build_llamalike_block(
       )
     ffw_layer = pz.nn.Sequential(ffw_sequence)
   attn_delta = pz.nn.Sequential(attn_sequence)
-  if config.use_skip_scale:
-    attn_residual = pz.nn.ScaledResidual(
-        delta=attn_delta,
-        scale=parameters.make_parameter(
-            f"{name}/skip.scale",
-            init_base_rng,
-            initializer=lambda _rng: pz.nx.wrap(jnp.array(1.0)),
-        ),
-    )
-  else:
-    attn_residual = pz.nn.Residual(attn_delta)
-
   block_sublayers = [
-      attn_residual,
+      pz.nn.Residual(attn_delta),
       pz.nn.Residual(ffw_layer),
   ]
 
@@ -968,6 +973,18 @@ def build_llamalike_block(
                 across_axes={"embedding": config.embedding_dim},
                 dtype=config.parameter_dtype,
                 epsilon=config.rms_norm_eps,
+            ),
+        )
+    )
+
+  # Trailing learnable scalar that scales the entire block output (Gemma 4).
+  if config.use_skip_scale:
+    block_sublayers.append(
+        pz.nn.LearnableRescale(
+            scale=parameters.make_parameter(
+                f"{name}/skip.scale",
+                init_base_rng,
+                initializer=lambda _rng: pz.nx.wrap(jnp.array(1.0)),
             ),
         )
     )
@@ -1077,18 +1094,22 @@ def build_llamalike_transformer(
           pz.StateVariable(value=None, label=f"{name}/kv_key_{i}"),
           pz.StateVariable(value=None, label=f"{name}/kv_value_{i}"),
       )
-    # Map shared layers to source layers, cycling by attention type.
-    non_shared_by_type: dict[str, list[int]] = {}
+    # Map shared layers to the LAST non-shared layer of the same attention
+    # type. This matches the Gemma 4 reference (gm/nn/gemma4/_config.py:
+    # ``create_kv_cache_sharing_patterns``), where every shared global layer
+    # reuses K/V from the last non-shared global layer, and likewise for
+    # sliding layers.
+    last_source_by_type: dict[str, int] = {}
     for i in range(num_non_shared):
-      type_key = type(attn_types[i]).__name__
-      non_shared_by_type.setdefault(type_key, []).append(i)
-    shared_counters = {k: 0 for k in non_shared_by_type}
+      last_source_by_type[type(attn_types[i]).__name__] = i
     for j in range(num_non_shared, config.num_decoder_blocks):
       type_key = type(attn_types[j]).__name__
-      sources = non_shared_by_type[type_key]
-      source_idx = sources[shared_counters[type_key] % len(sources)]
-      kv_source_map[j] = source_idx
-      shared_counters[type_key] += 1
+      if type_key not in last_source_by_type:
+        raise ValueError(
+            f"KV-shared layer {j} has attention type {type_key} but no"
+            " non-shared source layer of that type exists."
+        )
+      kv_source_map[j] = last_source_by_type[type_key]
 
   if config.use_layer_stack:
     if not isinstance(config.attention_type, AttentionType):

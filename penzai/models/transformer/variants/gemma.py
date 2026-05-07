@@ -224,9 +224,11 @@ _GEMMA_PRESETS = {
         ),
         use_qk_norm=True,
         use_value_norm=True,
+        value_norm_with_scale=False,
         use_post_attn_norm=True,
         use_post_ffw_norm=True,
         use_skip_scale=True,
+        scale_plus_one_at_load=False,
         k_eq_v_global=True,
         global_rope_proportion=0.25,
         rope_wavelength=1_000_000,
@@ -249,9 +251,15 @@ _GEMMA_PRESETS = {
         ),
         use_qk_norm=True,
         use_value_norm=True,
+        value_norm_with_scale=False,
         use_post_attn_norm=True,
         use_post_ffw_norm=True,
         use_skip_scale=True,
+        scale_plus_one_at_load=False,
+        final_logit_softcap=30.0,
+        # Gemma 4 omits the conventional 1/sqrt(head_dim) query scaling and
+        # relies on QK-norm to keep attention logits well-scaled.
+        query_scaling_factor=1.0,
         global_rope_proportion=0.25,
         rope_wavelength=1_000_000,
         local_rope_wavelength=10_000,
@@ -275,9 +283,15 @@ _GEMMA_PRESETS = {
         ),
         use_qk_norm=True,
         use_value_norm=True,
+        value_norm_with_scale=False,
         use_post_attn_norm=True,
         use_post_ffw_norm=True,
         use_skip_scale=True,
+        scale_plus_one_at_load=False,
+        final_logit_softcap=30.0,
+        # Gemma 4 omits the conventional 1/sqrt(head_dim) query scaling and
+        # relies on QK-norm to keep attention logits well-scaled.
+        query_scaling_factor=1.0,
         global_rope_proportion=0.25,
         rope_wavelength=1_000_000,
         local_rope_wavelength=10_000,
@@ -302,9 +316,11 @@ _GEMMA_PRESETS = {
         ),
         use_qk_norm=True,
         use_value_norm=True,
+        value_norm_with_scale=False,
         use_post_attn_norm=True,
         use_post_ffw_norm=True,
         use_skip_scale=True,
+        scale_plus_one_at_load=False,
         k_eq_v_global=True,
         global_rope_proportion=0.25,
         rope_wavelength=1_000_000,
@@ -329,6 +345,89 @@ _NEEDS_GATING_TRANSPOSE = {
     "gemma4_e4b": True,
     "gemma4_26b_a4b": True,
 }
+
+# Norm keys that Gemma 4 stores without underscore prefix but the loader
+# expects with one (matching the Gemma 3 naming convention).
+_NORM_KEY_RENAMES = {
+    "query_norm": "_query_norm",
+    "key_norm": "_key_norm",
+    "value_norm": "_value_norm",
+}
+
+
+def _flatten_to_leaves(
+    d: dict[str, Any], prefix: str = ""
+) -> dict[str, Any]:
+  """Recursively flatten a dict, stopping at leaf values and leaf dicts.
+
+  A "leaf dict" is a dict where no values are themselves dicts
+  (e.g. ``{"w": ndarray}`` or ``{"scale": ndarray}``).
+  """
+  result: dict[str, Any] = {}
+  for k, v in d.items():
+    k = _NORM_KEY_RENAMES.get(k, k)
+    key = f"{prefix}/{k}" if prefix else k
+    if isinstance(v, dict):
+      if any(isinstance(sv, dict) for sv in v.values()):
+        # Has nested sub-dicts → flatten further.
+        result.update(_flatten_to_leaves(v, key))
+      else:
+        # Leaf dict (all values are arrays/scalars).
+        result[key] = v
+    else:
+      # Bare array or scalar.
+      result[key] = v
+  return result
+
+
+def _normalize_gemma_params(ckpt_params: dict[str, Any]) -> dict[str, Any]:
+  """Normalize checkpoint params to the semi-flat format expected by the loader.
+
+  Handles two checkpoint formats:
+
+  - **Semi-flat** (Gemma 1-3): Top-level keys are slash-separated paths like
+    ``"transformer/layer_0/attn/_query_norm"`` mapping to leaf dicts like
+    ``{"scale": ndarray}``.
+  - **Nested** (Gemma 4): Top-level keys are simple like ``"layer_0"``
+    mapping to deeply nested dicts.
+
+  For nested checkpoints, also renames Gemma 4 norm keys (``query_norm`` →
+  ``_query_norm``, etc.) to match the Gemma 3 convention used by the loader.
+  """
+  # Semi-flat format: has slash-separated top-level keys.
+  if any("/" in str(k) for k in ckpt_params):
+    return {k.removeprefix("transformer/"): v for k, v in ckpt_params.items()}
+
+  # Nested format. Extract "transformer" sub-tree if present.
+  tree = ckpt_params.get("transformer", ckpt_params)
+  if not isinstance(tree, dict):
+    tree = ckpt_params
+
+  result: dict[str, Any] = {}
+  for key, value in tree.items():
+    if not isinstance(value, dict):
+      result[key] = value
+      continue
+
+    if key.startswith("layer_"):
+      # Layer sub-trees: flatten everything to top-level flat keys.
+      for flat_key, flat_val in _flatten_to_leaves(value).items():
+        result[f"{key}/{flat_key}"] = flat_val
+    else:
+      # Non-layer (embedder, final_norm, ...): split bare arrays (grouped
+      # under the parent key) from sub-dicts (promoted to flat keys).
+      bare_items: dict[str, Any] = {}
+      for sub_key, sub_val in value.items():
+        if isinstance(sub_val, dict):
+          for flat_key, flat_val in _flatten_to_leaves(
+              {sub_key: sub_val}
+          ).items():
+            result[f"{key}/{flat_key}"] = flat_val
+        else:
+          bare_items[sub_key] = sub_val
+      if bare_items:
+        result[key] = bare_items
+  return result
 
 
 def gemma_from_pretrained_checkpoint(
@@ -379,7 +478,7 @@ def gemma_from_pretrained_checkpoint(
   Returns:
     A Transformer model containing the loaded parameters.
   """
-  params = {k.removeprefix("transformer/"): v for k, v in ckpt_params.items()}
+  params = _normalize_gemma_params(ckpt_params)
 
   if preset_name == "auto":
     num_layers = 0
@@ -390,7 +489,8 @@ def gemma_from_pretrained_checkpoint(
         and "layer_0/attn/_key_norm" in params
     )
     has_skip_scale = "layer_0/skip_scale" in params
-    has_ple = "embedder/per_layer_embeddings" in params
+    embedder = params.get("embedder", {})
+    has_ple = isinstance(embedder, dict) and "per_layer_embeddings" in embedder
     has_moe = "layer_0/mlp/per_expert_scale" in params
     is_match = False
     for gemma_preset_name, kwargs in _GEMMA_PRESETS.items():
@@ -443,98 +543,131 @@ def gemma_from_pretrained_checkpoint(
   model_def = llamalike_common.build_llamalike_transformer(
       config, init_base_rng=None, name="transformer"
   )
+
+  # RMSNorm scales are stored differently across Gemma versions: Gemma 1/2/3
+  # store ``actual - 1`` (so the runtime applies ``x * (1 + stored)``),
+  # while Gemma 4 stores ``actual`` directly. The runtime layer always applies
+  # ``x * scale``, so the loader normalizes here.
+  def _norm_scale(raw):
+    return (1 + raw) if config.scale_plus_one_at_load else raw
+
   parameter_mapping = {
       "embedder.embeddings": pz.nx.NamedArray.wrap(
           params["embedder"]["input_embedding"]
       ).tag("vocabulary", "embedding"),
       "final_norm/scale.weights": pz.nx.NamedArray.wrap(
-          1 + params["final_norm"]["scale"]
+          _norm_scale(params["final_norm"]["scale"])
       ).tag("embedding"),
   }
 
   # Add PLE (per-layer embeddings) parameters if present.
   if config.per_layer_input_dim is not None:
-    ple_raw = params["embedder"]["per_layer_embeddings"]
-    # Checkpoint stores as [vocab, num_layers * ple_dim]; reshape to
-    # [vocab, num_layers, ple_dim].
-    ple_reshaped = ple_raw.reshape(
-        config.vocab_size, config.num_decoder_blocks, config.per_layer_input_dim
+    # The reference declares this as (vocab, num_layers, ple_dim); some
+    # serialized formats flatten to (vocab, num_layers*ple_dim).
+    ple_raw = jnp.asarray(params["embedder"]["per_layer_embeddings"])
+    expected_table_shape = (
+        config.vocab_size,
+        config.num_decoder_blocks,
+        config.per_layer_input_dim,
     )
+    if ple_raw.shape != expected_table_shape:
+      ple_raw = ple_raw.reshape(expected_table_shape)
     parameter_mapping["embedder/per_layer_embeddings"] = (
-        pz.nx.NamedArray.wrap(ple_reshaped).tag(
+        pz.nx.NamedArray.wrap(ple_raw).tag(
             "vocabulary", "layers", "ple_input"
         )
     )
-    # Model projection: [num_layers * ple_dim, embedding_dim] in checkpoint.
-    ple_proj_raw = params["embedder"]["per_layer_model_projection"]
-    ple_proj_reshaped = ple_proj_raw.reshape(
+    # Model projection. The reference (gemma/gm/nn/gemma4/_modules.py) declares
+    # the parameter shape as (embedding_dim, num_layers, per_layer_input_dim).
+    # Tag axes by name so memory layout doesn't matter; if the checkpoint
+    # stores it flattened (one axis is the product of two), reshape first.
+    ple_proj_raw = jnp.asarray(
+        params["embedder/per_layer_model_projection"]["w"]
+    )
+    expected_shape = (
+        config.embedding_dim,
         config.num_decoder_blocks,
         config.per_layer_input_dim,
-        config.embedding_dim,
     )
+    if ple_proj_raw.shape != expected_shape:
+      ple_proj_raw = ple_proj_raw.reshape(expected_shape)
     parameter_mapping[
         "embedder/per_layer_model_projection.weights"
-    ] = pz.nx.NamedArray.wrap(ple_proj_reshaped).tag(
-        "layers", "ple_input", "embedding"
+    ] = pz.nx.NamedArray.wrap(ple_proj_raw).tag(
+        "embedding", "layers", "ple_input"
     )
     # Projection norm.
     parameter_mapping[
         "embedder/per_layer_projection_norm/scale.weights"
     ] = pz.nx.NamedArray.wrap(
-        1 + params["embedder"]["per_layer_projection_norm"]["scale"]
+        _norm_scale(params["embedder/per_layer_projection_norm"]["scale"])
     ).tag("ple_input")
 
   all_block_params = []
+
+  num_non_shared = config.num_decoder_blocks - config.num_kv_shared_layers
 
   for i in range(config.num_decoder_blocks):
     cur_block_params = {}
     all_block_params.append(cur_block_params)
 
+    # KV-shared layers reuse activations from source layers and don't have
+    # their own key/value weights or norms.
+    is_kv_shared = i >= num_non_shared
+
     cur_block_params["pre_attention_norm/scale.weights"] = (
         pz.nx.NamedArray.wrap(
-            1 + params[f"layer_{i}/pre_attention_norm"]["scale"]
+            _norm_scale(params[f"layer_{i}/pre_attention_norm"]["scale"])
         ).tag("embedding")
     )
-    # Add qk norm if needed
+    # Add qk norm if needed. Key/value norms are skipped for KV-shared
+    # layers since those use _ReadStoredActivation (no projection pipeline).
     if config.use_qk_norm:
       cur_block_params["attention/query_norm/scale.weights"] = (
           pz.nx.NamedArray.wrap(
-              1 + params[f"layer_{i}/attn/_query_norm"]["scale"]
+              _norm_scale(params[f"layer_{i}/attn/_query_norm"]["scale"])
           ).tag("projection")
       )
-      cur_block_params["attention/key_norm/scale.weights"] = (
-          pz.nx.NamedArray.wrap(
-              1 + params[f"layer_{i}/attn/_key_norm"]["scale"]
-          ).tag("projection")
-      )
+      if not is_kv_shared:
+        cur_block_params["attention/key_norm/scale.weights"] = (
+            pz.nx.NamedArray.wrap(
+                _norm_scale(params[f"layer_{i}/attn/_key_norm"]["scale"])
+            ).tag("projection")
+        )
 
-    # Add value norm if needed (Gemma 4).
-    if config.use_value_norm:
+    # Value norm: only emit a scale parameter when one exists in the
+    # checkpoint (i.e., not for Gemma 4, which uses pure RMSStandardize).
+    if (
+        config.use_value_norm
+        and config.value_norm_with_scale
+        and not is_kv_shared
+    ):
       cur_block_params["attention/value_norm/scale.weights"] = (
           pz.nx.NamedArray.wrap(
-              1 + params[f"layer_{i}/attn/_value_norm"]["scale"]
+              _norm_scale(params[f"layer_{i}/attn/_value_norm"]["scale"])
           ).tag("projection")
       )
 
     if config.use_post_attn_norm:
       cur_block_params["post_attention_norm/scale.weights"] = (
           pz.nx.NamedArray.wrap(
-              1 + params[f"layer_{i}/post_attention_norm"]["scale"]
+              _norm_scale(params[f"layer_{i}/post_attention_norm"]["scale"])
           ).tag("embedding")
       )
 
-    # Add skip scale if needed (Gemma 4).
+    # Add skip scale if needed (Gemma 4). Checkpoint may store as a
+    # length-1 vector; squeeze to scalar to match the model's expectation.
     if config.use_skip_scale:
       cur_block_params["skip.scale"] = pz.nx.NamedArray.wrap(
-          params[f"layer_{i}/skip_scale"]
+          jnp.asarray(params[f"layer_{i}/skip_scale"]).reshape(())
       )
 
     cur_block_params["pre_ffw_norm/scale.weights"] = pz.nx.NamedArray.wrap(
-        1 + params[f"layer_{i}/pre_ffw_norm"]["scale"]
+        _norm_scale(params[f"layer_{i}/pre_ffw_norm"]["scale"])
     ).tag("embedding")
     if config.use_post_ffw_norm:
       cur_block_params["post_ffw_norm/scale.weights"] = pz.nx.NamedArray.wrap(
-          1 + params[f"layer_{i}/post_ffw_norm"]["scale"]
+          _norm_scale(params[f"layer_{i}/post_ffw_norm"]["scale"])
       ).tag("embedding")
 
     if config.num_experts is not None:
@@ -578,17 +711,17 @@ def gemma_from_pretrained_checkpoint(
       # Additional norms for MoE dual-branch structure.
       cur_block_params["pre_ffw2_norm/scale.weights"] = (
           pz.nx.NamedArray.wrap(
-              1 + params[f"layer_{i}/pre_ffw2_norm"]["scale"]
+              _norm_scale(params[f"layer_{i}/pre_ffw2_norm"]["scale"])
           ).tag("embedding")
       )
       cur_block_params["post_ffw1_norm/scale.weights"] = (
           pz.nx.NamedArray.wrap(
-              1 + params[f"layer_{i}/post_ffw1_norm"]["scale"]
+              _norm_scale(params[f"layer_{i}/post_ffw1_norm"]["scale"])
           ).tag("embedding")
       )
       cur_block_params["post_ffw2_norm/scale.weights"] = (
           pz.nx.NamedArray.wrap(
-              1 + params[f"layer_{i}/post_ffw2_norm"]["scale"]
+              _norm_scale(params[f"layer_{i}/post_ffw2_norm"]["scale"])
           ).tag("embedding")
       )
     else:
@@ -628,12 +761,6 @@ def gemma_from_pretrained_checkpoint(
     layer_query_head_multiplier = total_query_heads // layer_num_kv_heads
     layer_k_eq_v = layer_is_global and config.k_eq_v_global
 
-    # KV-shared layers do not have their own key/value weights.
-    num_non_shared = (
-        config.num_decoder_blocks - config.num_kv_shared_layers
-    )
-    is_kv_shared = i >= num_non_shared
-
     # Add per-layer PLE weights if enabled.
     if config.per_layer_input_dim is not None:
       cur_block_params["per_layer_input_gate.weights"] = (
@@ -648,8 +775,9 @@ def gemma_from_pretrained_checkpoint(
       )
       cur_block_params["post_per_layer_input_norm/scale.weights"] = (
           pz.nx.NamedArray.wrap(
-              1
-              + params[f"layer_{i}/post_per_layer_input_norm"]["scale"]
+              _norm_scale(
+                  params[f"layer_{i}/post_per_layer_input_norm"]["scale"]
+              )
           ).tag("embedding")
       )
 

@@ -93,6 +93,24 @@ class ScaledResidual(layer_base.Layer):
 
 
 @struct.pytree_dataclass
+class LearnableRescale(layer_base.Layer):
+  """Multiplies its input by a learnable scalar parameter.
+
+  Mirrors `ConstantRescale` but with a learnable scalar instead of a fixed
+  constant. Used by models that scale a block's output by a learned factor,
+  such as Gemma 4's ``skip_scale``.
+
+  Attributes:
+    scale: Learnable scalar factor applied multiplicatively to the input.
+  """
+
+  scale: parameters.ParameterLike
+
+  def __call__(self, value: Any, **side_inputs: dict[Any, Any]) -> Any:
+    return value * self.scale.value
+
+
+@struct.pytree_dataclass
 class BranchAndAddTogether(layer_base.Layer):
   """A data-flow branch with additive interactions between branches.
 
